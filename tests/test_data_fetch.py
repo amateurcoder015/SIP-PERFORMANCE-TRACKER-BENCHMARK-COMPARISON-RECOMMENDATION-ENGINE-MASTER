@@ -79,7 +79,7 @@ def test_fetch_fund_nav_history_invalid_scheme():
 
 
 def test_fetch_fund_nav_history_insufficient_points():
-    """Test ValueError raised when NAV series has < 30 points."""
+    """Test ValueError raised when NAV series has < min_api_response_points."""
     short_data = {
         "status": "SUCCESS",
         "meta": {"scheme_code": 123456, "scheme_name": "Test Fund"},
@@ -91,8 +91,36 @@ def test_fetch_fund_nav_history_insufficient_points():
         mock_resp.json.return_value = short_data
         mock_get.return_value = mock_resp
 
-        with pytest.raises(ValueError, match="insufficient historical NAV points"):
+        with pytest.raises(ValueError, match="corrupt/insufficient API payload"):
             fetch_fund_nav_history(123456)
+
+
+def test_validate_sufficient_history():
+    """Test validate_sufficient_history date span and density checks."""
+    from src._validators import validate_sufficient_history
+    from datetime import timedelta
+
+    # 1. Valid 3-year daily NAV series
+    start = date(2020, 1, 1)
+    valid_3y = [(start + timedelta(days=i), 10.0 + i*0.01) for i in range(1100)]
+    
+    # Should pass without error for 3 years
+    validate_sufficient_history(valid_3y, required_years=3.0)
+
+    # 2. Insufficient date span (only 1.5 years provided, 3 years requested)
+    short_series = valid_3y[:500]
+    with pytest.raises(ValueError, match="insufficient for the requested 3.0-year return analysis"):
+        validate_sufficient_history(short_series, required_years=3.0)
+
+    # 3. Severe data gap / sparse density check
+    sparse_series = [
+        (date(2020, 1, 1), 10.0),
+        (date(2021, 1, 1), 12.0),
+        (date(2022, 1, 1), 14.0),
+        (date(2023, 1, 1), 16.0),
+    ]
+    with pytest.raises(ValueError, match="significant data gaps"):
+        validate_sufficient_history(sparse_series, required_years=3.0, min_annual_trading_days=180.0)
 
 
 def test_fetch_scheme_list(mock_scheme_list):

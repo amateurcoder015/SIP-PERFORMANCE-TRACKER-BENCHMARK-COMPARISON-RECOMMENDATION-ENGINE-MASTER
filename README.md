@@ -35,12 +35,14 @@ This tool:
   - Top-level JSON keys: `meta`, `data`, `status`.
   - `meta` fields: `scheme_code` (int), `scheme_name` (str), `fund_house` (str), `scheme_category` (str), `scheme_type` (str).
   - `data` array entries: `{'date': 'DD-MM-YYYY', 'nav': '90.52890'}`.
+  - **API Sanity Threshold**: `fetch_fund_nav_history()` uses `min_api_response_points: int = 30` strictly as a low-level API response sanity check to reject empty or corrupted payloads.
   - **Expense Ratio**: `mfapi.in` metadata does not supply expense ratios. Documented as a known API limitation rather than fabricating mock values.
 - **Scheme List Summary Endpoint**: `https://api.mfapi.in/mf`
   - Returns array of ~37,800 scheme objects. Keys: `schemeCode`, `schemeName`, `isinGrowth`, `isinDivReinvestment`.
-  - Category information is **not** present at the scheme list summary level (only in detail endpoints).
+  - Category information is **not** present at the scheme list summary level (only present in detail endpoints).
 
-### 2. Ordering & Sign Conventions
+### 2. Validation & Conventions
+- **Shared Date Span & Density Validation**: `validate_sufficient_history(nav_series, required_years)` in `src/_validators.py` provides shared date-span ($T_{\text{max}} - T_{\text{min}} \ge \text{required\_years}$) and annual data density validation ($\ge 180$ NAV entries/year) for Step 3 and Step 4 metrics.
 - **Ascending Date Ordering**: `mfapi.in` delivers historical NAV points in **descending** order (newest first). `FundNAVHistory` and `BenchmarkSeries` explicitly sort and normalize all NAV series into **ASCENDING** order (`oldest -> newest`) to meet Step 1 core math requirements.
 - **Positive Transaction Amounts**: `ParsedSIPTransaction.amount` stores contribution amounts as **POSITIVE** numbers (`> 0`) representing uncorrupted user CSV inputs. The negative sign flip (`< 0`) required by `calculate_xirr()` is performed at cashflow assembly in Step 3.
 

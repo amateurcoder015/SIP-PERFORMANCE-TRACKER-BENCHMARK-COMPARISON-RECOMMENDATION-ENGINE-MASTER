@@ -135,3 +135,51 @@ def validate_nav_series(nav_series: Sequence[NAVPoint]) -> list[Tuple[date, floa
     # Return sorted by date
     normalized.sort(key=lambda x: x[0])
     return normalized
+
+
+def validate_sufficient_history(
+    nav_series: Sequence[NAVPoint],
+    required_years: float,
+    min_annual_trading_days: float = 180.0,
+) -> None:
+    """
+    Validate that a NAV time series covers a sufficient financial date span
+    and possesses adequate data density (checking against major outages/gaps).
+
+    Parameters
+    ----------
+    nav_series : Sequence[Tuple[date, float]]
+        Time series of (date, nav) tuples.
+    required_years : float
+        Minimum required time span in years (e.g. 1.0, 3.0, 5.0).
+    min_annual_trading_days : float, default 180.0
+        Minimum required average NAV points per calendar year to catch severe data outages.
+
+    Raises
+    ------
+    ValueError
+        If nav_series span is less than required_years or data density is insufficient.
+    """
+    validated = validate_nav_series(nav_series)
+
+    if required_years <= 0:
+        raise ValueError(f"required_years must be strictly positive (> 0), got {required_years}")
+
+    t_min = validated[0][0]
+    t_max = validated[-1][0]
+    total_days = (t_max - t_min).days
+
+    required_days = int(round(required_years * 365.25))
+    actual_years = total_days / 365.25
+
+    if total_days < required_days:
+        raise ValueError(
+            f"Fund has {actual_years:.1f} years of NAV history ({t_min} to {t_max}), "
+            f"which is insufficient for the requested {required_years}-year return analysis."
+        )
+
+    avg_annual_density = len(validated) / max(actual_years, 0.1)
+    if avg_annual_density < min_annual_trading_days:
+        raise ValueError(
+            f"Fund NAV history has significant data gaps ({avg_annual_density:.1f} NAV points/year < {min_annual_trading_days:.1f} required threshold)."
+        )

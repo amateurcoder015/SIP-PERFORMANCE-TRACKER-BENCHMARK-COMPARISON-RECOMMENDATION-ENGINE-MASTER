@@ -179,6 +179,7 @@ def fetch_fund_nav_history(
     scheme_code: Union[int, str],
     session: Optional[requests.Session] = None,
     timeout: int = 15,
+    min_api_response_points: int = 30,
 ) -> FundNAVHistory:
     """
     Fetch and normalize mutual fund NAV history and metadata from mfapi.in.
@@ -191,6 +192,10 @@ def fetch_fund_nav_history(
         Optional requests session for mocking or connection pooling.
     timeout : int, default 15
         Request timeout in seconds.
+    min_api_response_points : int, default 30
+        Minimum low-level API sanity threshold to reject empty or corrupted API payloads.
+        (Note: Financial span sufficiency e.g. 1y/3y/5y CAGR is validated separately by
+        validate_sufficient_history).
 
     Returns
     -------
@@ -200,7 +205,7 @@ def fetch_fund_nav_history(
     Raises
     ------
     ValueError
-        If scheme_code is invalid, scheme not found, or NAV series has < 30 points.
+        If scheme_code is invalid, scheme not found, or NAV payload has < min_api_response_points.
     """
     clean_code = str(scheme_code).strip()
     url = f"{MFAPI_BASE_URL}/{clean_code}"
@@ -237,9 +242,9 @@ def fetch_fund_nav_history(
             except (ValueError, TypeError):
                 continue
 
-    if len(nav_points) < 30:
+    if len(nav_points) < min_api_response_points:
         raise ValueError(
-            f"Scheme '{clean_code}' has insufficient historical NAV points ({len(nav_points)} < 30) for return calculations."
+            f"Scheme '{clean_code}' returned corrupt/insufficient API payload ({len(nav_points)} points < {min_api_response_points} min API sanity threshold)."
         )
 
     # Sort ascending by date (since mfapi.in delivers descending order)
