@@ -21,42 +21,31 @@ This tool:
 ## Project Roadmap
 
 - [x] **Step 1 (Core Math Engine)**: XIRR calculation engine, CAGR / Rolling CAGR module, and cashflow benchmark replication logic. Pure mathematical calculations fully unit-tested against hand-verified cashflow examples.
-- [x] **Step 2 (Data Layer — THIS RELEASE)**: Real mutual fund NAV and scheme metadata fetcher via `mfapi.in`, real benchmark index fetcher via `yfinance`, and CSV transaction parser with zero live-network dependency in unit tests.
-- [ ] **Step 3 (Per-Fund Performance Engine)**: Orchestration layer computing actual XIRR vs benchmark-equivalent XIRR per fund.
+- [x] **Step 2 (Data Layer)**: Real mutual fund NAV and scheme metadata fetcher via `mfapi.in`, real benchmark index fetcher via `yfinance`, and CSV transaction parser with zero live-network dependency in unit tests.
+- [x] **Step 3 (Per-Fund Performance Engine — THIS RELEASE)**: Single-fund and multi-fund performance orchestrators computing actual XIRR vs benchmark-equivalent XIRR and absolute alpha for identical cashflows.
 - [ ] **Step 4 (Recommendation Engine)**: Multi-metric peer fund scoring and ranking based on rolling return consistency, expense ratio, and risk-adjusted metrics.
 - [ ] **Step 5 (Dashboard & Visual UI)**: Interactive decision-support web UI with disclaimers across all viewports.
 
 ---
 
-## Step 2 Data Layer Specifications & Empirical Findings
+## Step 3 Performance Engine Specifications
 
-### 1. Data Source Endpoints & Fields (`mfapi.in`)
-- **Detail Endpoint**: `https://api.mfapi.in/mf/{scheme_code}`
-  - Top-level JSON keys: `meta`, `data`, `status`.
-  - `meta` fields: `scheme_code` (int), `scheme_name` (str), `fund_house` (str), `scheme_category` (str), `scheme_type` (str).
-  - `data` array entries: `{'date': 'DD-MM-YYYY', 'nav': '90.52890'}`.
-  - **API Sanity Threshold**: `fetch_fund_nav_history()` uses `min_api_response_points: int = 30` strictly as a low-level API response sanity check to reject empty or corrupted payloads.
-  - **Expense Ratio**: `mfapi.in` metadata does not supply expense ratios. Documented as a known API limitation rather than fabricating mock values.
-- **Scheme List Summary Endpoint**: `https://api.mfapi.in/mf`
-  - Returns array of ~37,800 scheme objects. Keys: `schemeCode`, `schemeName`, `isinGrowth`, `isinDivReinvestment`.
-  - Category information is **not** present at the scheme list summary level (only present in detail endpoints).
+### 1. Units & Current Value Calculation (`compute_units_and_current_value`)
+- **Date Matching**: SIP transactions are matched against the fund's NAV on that exact date. If no exact match exists (weekend/market holiday), the nearest **PRIOR** available NAV date is used.
+- **Mismatch Tolerance Flagging**: If the nearest prior NAV date differs from the transaction date by $> 5$ calendar days (default tolerance), a warning is flagged in `FundPerformanceResult.nav_date_mismatch_warnings`.
+- **Valuation Date**: Defaults to the latest available NAV date in `FundNAVHistory`. If a `valuation_date` is requested that exceeds the latest available NAV date, a `ValueError` is raised.
 
-### 2. Validation & Conventions
-- **Shared Date Span & Density Validation**: `validate_sufficient_history(nav_series, required_years)` in `src/_validators.py` provides shared date-span ($T_{\text{max}} - T_{\text{min}} \ge \text{required\_years}$) and annual data density validation ($\ge 180$ NAV entries/year) for Step 3 and Step 4 metrics.
-- **Ascending Date Ordering**: `mfapi.in` delivers historical NAV points in **descending** order (newest first). `FundNAVHistory` and `BenchmarkSeries` explicitly sort and normalize all NAV series into **ASCENDING** order (`oldest -> newest`) to meet Step 1 core math requirements.
-- **Positive Transaction Amounts**: `ParsedSIPTransaction.amount` stores contribution amounts as **POSITIVE** numbers (`> 0`) representing uncorrupted user CSV inputs. The negative sign flip (`< 0`) required by `calculate_xirr()` is performed at cashflow assembly in Step 3.
+### 2. Derived Cashflow Lists
+- **Actual Investor Cashflows**: `[(date, -amount) for transactions] + [(effective_valuation_date, +current_value)]`. Evaluated via `calculate_xirr()` to compute `actual_xirr`.
+- **Fund Cashflows for Benchmark Replication**: `[(date, -amount) for transactions] + [(effective_valuation_date, +current_value)]`. Replicated via `replicate_cashflows_in_benchmark()`, then evaluated via `calculate_xirr()` to compute `benchmark_xirr`.
+- **Alpha**: $\text{Alpha} = \text{actual\_xirr} - \text{benchmark\_xirr}$.
 
-### 3. Benchmark Index Coverage & Gaps (`yfinance`)
-- **Confirmed Working Tickers**:
-  - `NIFTY50`: `^NSEI` (Nifty 50 Index)
-  - `SENSEX`: `^BSESN` (S&P BSE Sensex Index)
-  - `NIFTYMIDCAP`: `^NSMIDCP` (Nifty Midcap 100 Index)
-  - `NIFTYBANK`: `^NSEBANK` (Nifty Bank Index)
-- **Known Coverage Gap (Nifty Next 50)**: `yfinance` does not carry a working ticker for Nifty Next 50 (tickers like `^NIFTYNEXT50` and `^CNXNIFTY` return HTTP 404 / Quote not found). Requesting `"NIFTYNEXT50"` raises a clear `ValueError` naming unsupported benchmarks.
-- **Price Field Choice**: `Close` is used as index levels do not undergo dividend or corporate action adjustments.
+### 3. Investor History Span Validation (`min_years_required`)
+`validate_sufficient_history()` validates that the investor's **actual transaction window** ($T_{\text{first\_transaction}} \to T_{\text{effective\_valuation}}$) spans at least `min_years_required` (default 1.0 year).
 
-### 4. Scheme Category Granularity Finding
-`mfapi.in` `scheme_category` fields use standardized strings such as `'Equity Scheme - Flexi Cap Fund'`, `'Equity Scheme - Mid Cap Fund'`, `'Equity Schemes - ELSS- Tax Saver Fund'`. Extracting core category keywords (e.g., `"Flexi Cap"`, `"Mid Cap"`, `"ELSS"`) provides clean category grouping for Step 4 peer recommendations.
+### 4. Single-Fund vs. Multi-Fund Exception Handling
+- **Single-Fund (`evaluate_fund_performance`)**: Propagates Step 1 and Step 2 validation errors directly (`ValueError` raised).
+- **Multi-Fund Batch (`evaluate_all_funds`)**: Captures exceptions per scheme in `dict[str, FundPerformanceResult | Exception]` so one bad or short fund does not abort batch evaluation of other funds.
 
 ---
 
@@ -64,27 +53,25 @@ This tool:
 
 ```
 .
-├── README.md                     # Project overview, roadmap, and data layer specifications
-├── requirements.txt              # Core math, data, & test dependencies
+├── README.md                     # Project overview, roadmap, and specifications
+├── pytest.ini                    # Pytest configuration
+├── requirements.txt              # Project dependencies
 ├── src/
 │   ├── __init__.py
-│   ├── _validators.py            # Shared input structure & cashflow validators (Step 1)
+│   ├── _validators.py            # Shared validators & validate_sufficient_history (Step 1+2)
 │   ├── cagr.py                   # Point-to-point CAGR and rolling trailing CAGR (Step 1)
-│   ├── cashflow_replication.py   # Benchmark cashflow replication simulation engine (Step 1)
+│   ├── cashflow_replication.py   # Benchmark cashflow replication engine (Step 1)
 │   ├── data_fetch.py             # Data models, CSV parser, MF NAV & benchmark fetchers (Step 2)
+│   ├── performance_engine.py     # Per-fund performance orchestrator & alpha engine (Step 3)
 │   └── xirr.py                   # Newton-Raphson XIRR solver (Step 1)
 └── tests/
-    ├── fixtures/                 # Frozen API JSON/CSV response fixtures from Step 0
-    │   ├── benchmark_nifty50_sample.csv
-    │   ├── mfapi_scheme_120503.json
-    │   ├── mfapi_scheme_120505.json
-    │   ├── mfapi_scheme_122639.json
-    │   └── mfapi_scheme_list_sample.json
+    ├── fixtures/                 # Frozen API response fixtures from Step 0
     ├── test_cagr.py              # Unit tests for CAGR (Step 1)
     ├── test_cashflow_replication.py # Hand-verified benchmark replication tests (Step 1)
     ├── test_csv_parsing.py       # Unit tests for CSV parser (Step 2)
-    ├── test_data_fetch.py        # Fixture-based unit tests for data fetchers (Step 2)
+    ├── test_data_fetch.py        # Unit tests for data fetchers (Step 2)
     ├── test_integration_data_fetch.py # Live network integration test (Step 2)
+    ├── test_performance_engine.py # Hand-verified performance engine tests (Step 3)
     └── test_xirr.py              # Hand-verified XIRR unit tests (Step 1)
 ```
 
@@ -92,16 +79,9 @@ This tool:
 
 ## Running Tests
 
-### 1. Offline Unit Test Suite (Default)
-Executes all Step 1 math unit tests, fixture-based data layer tests, and CSV parser tests without live network calls:
 ```bash
-python3 -m pytest -m "not integration" -v
-```
-
-### 2. Live Integration Test
-Executes real network requests against `mfapi.in` and `yfinance`:
-```bash
-python3 -m pytest tests/test_integration_data_fetch.py -v
+# Run all unit and integration tests
+python3 -m pytest -v
 ```
 
 ---
