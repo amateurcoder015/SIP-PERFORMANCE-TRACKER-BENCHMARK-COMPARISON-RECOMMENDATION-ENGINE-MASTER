@@ -24,7 +24,63 @@ This tool:
 - [x] **Step 2 (Data Layer)**: Real mutual fund NAV and scheme metadata fetcher via `mfapi.in`, real benchmark index fetcher via `yfinance`, and CSV transaction parser with zero live-network dependency in unit tests.
 - [x] **Step 3 (Per-Fund Performance Engine)**: Single-fund and multi-fund performance orchestrators computing actual XIRR vs benchmark-equivalent XIRR and absolute alpha for identical cashflows.
 - [x] **Step 4 (Recommendation Engine — THIS RELEASE)**: Long-term-weighted peer discovery, category normalization, multi-window rolling CAGR scoring (50/30/20 composite model), plain-language rationale generator, and mandatory disclaimers.
-- [ ] **Step 5 (Dashboard & Visual UI)**: Interactive decision-support web UI with disclaimers across all viewports.
+- [x] **Step 5 (Dashboard & Visual UI — FINAL RELEASE)**: React + FastAPI Bento-style web dashboard with per-fund XIRR cards, benchmark comparisons, long-term peer recommendations, and non-bypassable financial disclaimers.
+
+---
+
+## Running the Application
+
+### 1. Start the FastAPI Backend API
+```bash
+# Install Python requirements
+pip install -r requirements.txt
+
+# Start backend dev server (port 8000)
+python3 -m uvicorn api.main:app --reload --port 8000
+```
+
+### 2. Start the React Bento Dashboard
+```bash
+# Navigate to frontend directory
+cd frontend
+
+# Install node dependencies
+npm install
+
+# Start Vite dev server (port 5173)
+npm run dev
+```
+
+Open `http://localhost:5173` in your browser.
+
+---
+
+## Step 5 React + FastAPI Bento Dashboard Specifications
+
+### 1. Architecture & Endpoint Contracts
+
+- **`POST /api/upload-transactions`**: Accepts a `.csv` file upload, parses SIP transactions, and returns summary stats grouped by `scheme_code` before triggering slow API calls.
+- **`POST /api/performance`**: Body: `transactions`, `benchmark_name` (`NIFTY50`, `SENSEX`, `NIFTYMIDCAP`, `NIFTYBANK`), `valuation_date` (optional), `min_years_required` (default 1.0). Evaluates per-fund performance with per-fund exception isolation.
+- **`POST /api/recommend`**: Body: `target_scheme_code`, `max_candidates_to_confirm` (default 30), `top_n` (default 5), `min_years_required` (default 3.0). Returns long-term ranked shortlist with verbatim reasoning and mandatory disclaimer.
+
+### 2. In-Process Short TTL NAV Cache
+To optimize response times when users evaluate fund performance and subsequently click "Find Alternative Peer Recommendations", `api/main.py` implements a 5-minute ($300$-second) in-process TTL memory cache for scheme NAV history fetched from `mfapi.in`.
+
+### 3. Portfolio Summary Limitation (Capital Sums Only)
+The Portfolio Summary Bento Panel displays **simple capital sums ONLY**:
+- $\text{Total Invested} = \sum \text{total\_invested}_i$
+- $\text{Current Valuation} = \sum \text{current\_value}_i$
+- $\text{Absolute Gain} = \text{Current Valuation} - \text{Total Invested}$
+
+> [!IMPORTANT]
+> The application explicitly does **NOT** compute or display any blended multi-fund XIRR/CAGR rate. Combining cashflows across different funds into a single rate represents new financial scope not supported by Step 3's per-fund engine.
+
+### 4. Bento Grid Layout Breakdown
+- **Upload & Setup Panel**: Drag-and-drop CSV dropzone, benchmark selector dropdown, optional valuation date picker, parse summary box, and execution button.
+- **Portfolio Summary Panel**: Capital sum totals and gain/loss percentage.
+- **Per-Fund Performance Grid**: Cards displaying actual XIRR, benchmark XIRR, alpha badge (Emerald positive / Rose negative), investment span, units held, NAV mismatch warnings, or fund-level error messages.
+- **Recommendation Panel**: Displays target fund baseline score, top ranked peers, 3-year mean rolling CAGRs, consistency stdevs, verbatim rationale strings, skipped funds, and **the mandatory, non-bypassable financial advice disclaimer rendered prominently inside the card in golden-amber highlight**.
+- **Metadata Panel**: Provenance details, active benchmark specs, and data retrieved timestamps.
 
 ---
 
@@ -75,6 +131,23 @@ Every `RecommendationResult` object explicitly includes the mandatory financial 
 ├── README.md                     # Project overview, roadmap, and specifications
 ├── pytest.ini                    # Pytest configuration
 ├── requirements.txt              # Project dependencies
+├── api/
+│   ├── __init__.py
+│   ├── main.py                   # FastAPI backend endpoints, CORS & TTL cache
+│   └── test_main.py              # Backend API unit tests (TestClient)
+├── frontend/
+│   ├── index.html
+│   ├── package.json              # React + Vite + TypeScript + Tailwind CSS dependencies
+│   ├── vite.config.ts
+│   └── src/
+│       ├── App.tsx               # Bento Grid Dashboard layout
+│       ├── main.tsx
+│       ├── types.ts              # TypeScript API data structures
+│       ├── api.ts                # Fetch client for FastAPI endpoints
+│       ├── index.css             # Tailwind & Glassmorphism styles
+│       ├── utils/formatters.ts   # INR currency & percentage formatters
+│       ├── components/           # Bento Card components
+│       └── __tests__/            # Vitest frontend unit tests
 ├── src/
 │   ├── __init__.py
 │   ├── _validators.py            # Shared validators & validate_sufficient_history (Step 1+2)
@@ -101,14 +174,15 @@ Every `RecommendationResult` object explicitly includes the mandatory financial 
 ## Running Tests
 
 ```bash
-# Run all unit tests (offline)
-python3 -m pytest -m "not integration" -v
+# Run all Python backend unit & API tests (48 tests)
+python3 -m pytest -v
 
-# Run live integration tests (network access required)
-python3 -m pytest -m integration -v -s
+# Run frontend React component unit tests (Vitest - 6 tests)
+cd frontend && npm test
 ```
 
 ---
 
 ## License & Disclaimer
 This repository is for personal decision support and educational reference only. It does not constitute investment advice. Past performance does not guarantee future results.
+
