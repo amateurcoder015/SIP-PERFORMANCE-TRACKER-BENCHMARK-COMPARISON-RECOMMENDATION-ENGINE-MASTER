@@ -2,7 +2,7 @@
 
 > [!IMPORTANT]
 > **DISCLAIMER: NOT FINANCIAL ADVICE**
-> This tool provides comparative analytics based on historical data for personal informational use only; it is not personalized investment advice; past performance does not guarantee future results.
+> This tool provides comparative analytics based on historical mutual fund daily NAV data for personal informational use only. It is not personalized investment, financial, or tax advice, and past performance does not guarantee future results.
 
 ---
 
@@ -22,30 +22,35 @@ This tool:
 
 - [x] **Step 1 (Core Math Engine)**: XIRR calculation engine, CAGR / Rolling CAGR module, and cashflow benchmark replication logic. Pure mathematical calculations fully unit-tested against hand-verified cashflow examples.
 - [x] **Step 2 (Data Layer)**: Real mutual fund NAV and scheme metadata fetcher via `mfapi.in`, real benchmark index fetcher via `yfinance`, and CSV transaction parser with zero live-network dependency in unit tests.
-- [x] **Step 3 (Per-Fund Performance Engine — THIS RELEASE)**: Single-fund and multi-fund performance orchestrators computing actual XIRR vs benchmark-equivalent XIRR and absolute alpha for identical cashflows.
-- [ ] **Step 4 (Recommendation Engine)**: Multi-metric peer fund scoring and ranking based on rolling return consistency, expense ratio, and risk-adjusted metrics.
+- [x] **Step 3 (Per-Fund Performance Engine)**: Single-fund and multi-fund performance orchestrators computing actual XIRR vs benchmark-equivalent XIRR and absolute alpha for identical cashflows.
+- [x] **Step 4 (Recommendation Engine — THIS RELEASE)**: Long-term-weighted peer discovery, category normalization, multi-window rolling CAGR scoring (50/30/20 composite model), plain-language rationale generator, and mandatory disclaimers.
 - [ ] **Step 5 (Dashboard & Visual UI)**: Interactive decision-support web UI with disclaimers across all viewports.
 
 ---
 
-## Step 3 Performance Engine Specifications
+## Step 4 Recommendation Engine Specifications
 
-### 1. Units & Current Value Calculation (`compute_units_and_current_value`)
-- **Date Matching**: SIP transactions are matched against the fund's NAV on that exact date. If no exact match exists (weekend/market holiday), the nearest **PRIOR** available NAV date is used.
-- **Mismatch Tolerance Flagging**: If the nearest prior NAV date differs from the transaction date by $> 5$ calendar days (default tolerance), a warning is flagged in `FundPerformanceResult.nav_date_mismatch_warnings`.
-- **Valuation Date**: Defaults to the latest available NAV date in `FundNAVHistory`. If a `valuation_date` is requested that exceeds the latest available NAV date, a `ValueError` is raised.
+### 1. Two-Phase Peer Discovery Architecture
+- **Phase (a) Cheap Pre-Filter**: Scans full scheme list summaries (~37,800 items in memory), matching candidate scheme names containing category keywords (e.g. `"Flexi Cap"`) AND option keywords (`"Direct"` and `"Growth"`). Narrows candidates to ~30–60 scheme codes instantly without network overhead.
+- **Phase (b) Category Confirmation & Scoring**: Calls `fetch_fund_nav_history()` for up to `max_candidates_to_confirm` (default 30) pre-filtered candidates. Confirms actual `scheme_category` metadata matches the target fund's category, discarding non-matching categories.
+- **Pre-Filter Limitations**: Phase (a) is a heuristic filter that may miss peer funds with unconventional scheme names, or include funds whose name matches but whose true confirmed category differs (which Phase (b) safely filters out).
+- **Runtime Tradeoff**: Confirming 30 candidate funds requires 30 sequential API calls taking ~4–10 seconds.
 
-### 2. Derived Cashflow Lists
-- **Actual Investor Cashflows**: `[(date, -amount) for transactions] + [(effective_valuation_date, +current_value)]`. Evaluated via `calculate_xirr()` to compute `actual_xirr`.
-- **Fund Cashflows for Benchmark Replication**: `[(date, -amount) for transactions] + [(effective_valuation_date, +current_value)]`. Replicated via `replicate_cashflows_in_benchmark()`, then evaluated via `calculate_xirr()` to compute `benchmark_xirr`.
-- **Alpha**: $\text{Alpha} = \text{actual\_xirr} - \text{benchmark\_xirr}$.
+### 2. Long-Term Composite Scoring Formula (50 / 30 / 20 Split)
+For each candidate with $\ge 3$ years of NAV history, `score_fund_long_term()` computes rolling CAGRs across 3yr, 5yr, and 10yr windows:
+1. **50% Return Component**: Weighted average of `mean_rolling_cagr` across usable windows (10-year weight 0.50, 5-year weight 0.35, 3-year weight 0.15).
+2. **30% Return Consistency Component**: Derived from average `stdev_rolling_cagr` across usable windows. Lower rolling return variance yields a higher consistency score:
+   $$\text{Consistency Score} = \max(0.0, \text{Return Score} - 0.5 \times \text{Average Stdev})$$
+3. **20% Risk-Adjusted Component**: Sharpe-like ratio on the longest usable window:
+   $$\text{Sharpe Ratio} = \frac{\text{Mean Rolling CAGR} - 0.05}{\text{Stdev Rolling CAGR} + 1\text{e}-4}$$
+   $$\text{Composite Score} = 0.50 \times \text{Return Score} + 0.30 \times \text{Consistency Score} + 0.20 \times (\text{Sharpe Ratio} \times 0.05)$$
 
-### 3. Investor History Span Validation (`min_years_required`)
-`validate_sufficient_history()` validates that the investor's **actual transaction window** ($T_{\text{first\_transaction}} \to T_{\text{effective\_valuation}}$) spans at least `min_years_required` (default 1.0 year).
+### 3. Expense Ratio Signal (`expense_ratio_considered = False`)
+Because `mfapi.in` does not supply expense ratio metadata, `FundScore.expense_ratio_considered` is explicitly set to `False`. The 50/30/20 composite weighting formula accounts for its absence without fabricating mock proxy values.
 
-### 4. Single-Fund vs. Multi-Fund Exception Handling
-- **Single-Fund (`evaluate_fund_performance`)**: Propagates Step 1 and Step 2 validation errors directly (`ValueError` raised).
-- **Multi-Fund Batch (`evaluate_all_funds`)**: Captures exceptions per scheme in `dict[str, FundPerformanceResult | Exception]` so one bad or short fund does not abort batch evaluation of other funds.
+### 4. Mandatory Disclaimer Enforcement
+Every `RecommendationResult` object explicitly includes the mandatory financial advice disclaimer:
+> `DISCLAIMER: NOT FINANCIAL ADVICE. This tool provides comparative analytics based on historical mutual fund daily NAV data for personal informational use only. It is not personalized investment, financial, or tax advice, and past performance does not guarantee future results.`
 
 ---
 
@@ -63,6 +68,7 @@ This tool:
 │   ├── cashflow_replication.py   # Benchmark cashflow replication engine (Step 1)
 │   ├── data_fetch.py             # Data models, CSV parser, MF NAV & benchmark fetchers (Step 2)
 │   ├── performance_engine.py     # Per-fund performance orchestrator & alpha engine (Step 3)
+│   ├── recommendation_engine.py  # Peer discovery, long-term scoring & recommendation (Step 4)
 │   └── xirr.py                   # Newton-Raphson XIRR solver (Step 1)
 └── tests/
     ├── fixtures/                 # Frozen API response fixtures from Step 0
@@ -70,8 +76,9 @@ This tool:
     ├── test_cashflow_replication.py # Hand-verified benchmark replication tests (Step 1)
     ├── test_csv_parsing.py       # Unit tests for CSV parser (Step 2)
     ├── test_data_fetch.py        # Unit tests for data fetchers (Step 2)
-    ├── test_integration_data_fetch.py # Live network integration test (Step 2)
+    ├── test_integration_data_fetch.py # Live network integration test for data layer (Step 2)
     ├── test_performance_engine.py # Hand-verified performance engine tests (Step 3)
+    ├── test_recommendation_engine.py # Unit & integration tests for recommendation engine (Step 4)
     └── test_xirr.py              # Hand-verified XIRR unit tests (Step 1)
 ```
 
@@ -80,8 +87,11 @@ This tool:
 ## Running Tests
 
 ```bash
-# Run all unit and integration tests
-python3 -m pytest -v
+# Run all unit tests (offline)
+python3 -m pytest -m "not integration" -v
+
+# Run live integration tests (network access required)
+python3 -m pytest -m integration -v -s
 ```
 
 ---
