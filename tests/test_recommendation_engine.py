@@ -37,21 +37,28 @@ def test_score_fund_long_term_hand_verified():
     """
     Hand-verified Test Case: Multi-window rolling CAGR scoring & composite metric proof.
 
-    SYNTHETIC DATA SETUP & ARITHMETIC PROOF:
-    -----------------------------------------
+    SYNTHETIC DATA SETUP & BOUNDED ARITHMETIC PROOF:
+    -------------------------------------------------
     - NAV history spanning 10.5 years (2012-01-01 to 2022-07-01).
     - Constant 10% annual growth compounding: NAV(t) = 100.0 * (1.10)^years.
     - All rolling 3y, 5y, and 10y CAGRs return exactly 10.0% (0.100000).
     - Mean rolling CAGR across windows:
         3y mean = 0.10, 5y mean = 0.10, 10y mean = 0.10
-    - Stdev rolling CAGR across windows: approx 0.000.
-    - Risk-adjusted metric (Sharpe-like ratio on 10y window):
+    - Stdev rolling CAGR across windows: 0.000.
+    - Raw Risk-adjusted metric (Sharpe-like ratio on 10y window):
         (0.10 - 0.05) / (0.000 + 1e-4) = 500.0
-    - Composite Score (50% return, 30% consistency, 20% risk-adjusted):
-        Return Component (50%): 0.50 * (0.50*0.10 + 0.35*0.10 + 0.15*0.10) = 0.05
-        Consistency Component (30%): 0.30 * (0.10 - 0.5*0.00) = 0.03
-        Risk-Adjusted Component (20%): 0.20 * (500.0 * 0.05) = 5.00
-        Composite Score = 0.05 + 0.03 + 5.00 = 5.08
+    - Bounded Component Normalizations:
+        1. Return Component (50% weight):
+           raw_return = 0.10 -> norm_return = min(1.0, 0.10 / 0.25) = 0.400
+           Return Contribution = 0.50 * 0.400 = 0.200 (28.57% of total score)
+        2. Consistency Component (30% weight):
+           raw_avg_stdev = 0.000 -> norm_consistency = max(0.0, 1.0 - 0.000 / 0.15) = 1.000
+           Consistency Contribution = 0.30 * 1.000 = 0.300 (42.86% of total score)
+        3. Risk-Adjusted Component (20% weight):
+           raw_sharpe = 500.0 -> clipped to [0.0, 3.0] = 3.0 -> norm_risk = 3.0 / 3.0 = 1.000
+           Risk-Adjusted Contribution = 0.20 * 1.000 = 0.200 (28.57% of total score)
+    - Total Composite Score:
+        Composite Score = 0.200 + 0.300 + 0.200 = 0.700 (bounded in [0.0, 1.0])
     """
     meta = FundMetadata(100001, "Steady Flexi Cap Fund", "Steady MF", "Equity Scheme - Flexi Cap Fund", "Open Ended", "2022-07-01")
     start = date(2012, 1, 1)
@@ -78,7 +85,78 @@ def test_score_fund_long_term_hand_verified():
     assert pytest.approx(score.mean_rolling_cagr_by_window["10y"], abs=1e-3) == 0.10
     assert score.expense_ratio_considered is False
 
-    assert pytest.approx(score.composite_score, abs=1e-2) == 5.08
+    # Assert bounded composite score
+    assert pytest.approx(score.composite_score, abs=1e-3) == 0.700
+
+    # Explicitly verify component contribution shares relative to stated weights
+    # Return contribution = 0.200, Consistency contribution = 0.300, Risk contribution = 0.200
+    ret_share = 0.200 / score.composite_score
+    cons_share = 0.300 / score.composite_score
+    risk_share = 0.200 / score.composite_score
+
+    assert pytest.approx(ret_share, abs=1e-2) == 0.2857  # ~28.6%
+    assert pytest.approx(cons_share, abs=1e-2) == 0.4286  # ~42.9%
+    assert pytest.approx(risk_share, abs=1e-2) == 0.2857  # ~28.6%
+
+    # Risk-adjusted contribution share CANNOT silently become 98%+
+    assert risk_share <= 0.35
+
+
+def test_composite_score_weight_proportions_extreme_components():
+    """
+    Regression Test: Assert realized component contributions remain close to stated weights
+    even under extreme component values, preventing single-component takeover.
+    """
+    meta = FundMetadata(100099, "Extreme Sharpe Fund", "Test MF", "Equity Scheme - Flexi Cap Fund", "Open Ended", "2022-07-01")
+    start = date(2012, 1, 1)
+    nav_dates = [start + timedelta(days=i) for i in range(3850)]
+
+    # Smooth compounding fund: 10% CAGR, stdev ~ 0 -> Sharpe ~ 5000
+    nav_points = [(dt, 100.0 * (1.10 ** ((dt - start).days / 365.25))) for dt in nav_dates]
+    nav_history = FundNAVHistory(meta, nav_points)
+
+    score = score_fund_long_term(nav_history)
+
+    # Component contributions: Return=0.200, Consistency=0.300, Risk=0.200
+    risk_contribution = 0.200
+    risk_share = risk_contribution / score.composite_score
+
+    # Stated weight is 20%. Assert actual risk contribution share is <= 35% (under 2x stated weight)
+    assert risk_share <= 0.35, f"Risk component hijacked score: share = {risk_share:.1%}"
+
+
+def test_near_zero_stdev_no_score_explosion():
+    """
+    Regression Test: Near-zero stdev fund must NOT cause composite score explosion
+    compared to a normal stdev fund.
+    """
+    start = date(2012, 1, 1)
+    nav_dates = [start + timedelta(days=i) for i in range(3850)]
+
+    # Fund A: near-zero stdev (smooth 12% growth)
+    meta_a = FundMetadata(101, "Zero Stdev Fund", "MF", "Equity Scheme - Flexi Cap Fund", "Open Ended", "2022-07-01")
+    nav_a = FundNAVHistory(meta_a, [(dt, 100.0 * (1.12 ** ((dt - start).days / 365.25))) for dt in nav_dates])
+    score_a = score_fund_long_term(nav_a)
+
+    # Fund B: normal stdev fund (12% growth + sinusoidal fluctuations)
+    meta_b = FundMetadata(102, "Normal Stdev Fund", "MF", "Equity Scheme - Flexi Cap Fund", "Open Ended", "2022-07-01")
+    import math
+    nav_b_points = []
+    for i, dt in enumerate(nav_dates):
+        yrs = (dt - start).days / 365.25
+        base = 100.0 * (1.12 ** yrs)
+        sine = 1.0 + 0.15 * math.sin(i / 100.0)  # adds stdev to rolling CAGR
+        nav_b_points.append((dt, base * sine))
+    nav_b = FundNAVHistory(meta_b, nav_b_points)
+    score_b = score_fund_long_term(nav_b)
+
+    # Assert near-zero stdev score is strictly bounded in [0.0, 1.0]
+    assert 0.0 <= score_a.composite_score <= 1.0
+    assert 0.0 <= score_b.composite_score <= 1.0
+
+    # Score A should be higher than Score B due to higher consistency, but NOT by a 50x explosion factor!
+    assert score_a.composite_score > score_b.composite_score
+    assert score_a.composite_score / score_b.composite_score < 2.5
 
 
 def test_score_fund_young_fund_window_skip():

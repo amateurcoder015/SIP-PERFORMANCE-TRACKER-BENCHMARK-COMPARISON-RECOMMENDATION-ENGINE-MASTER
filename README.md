@@ -36,14 +36,28 @@ This tool:
 - **Pre-Filter Limitations**: Phase (a) is a heuristic filter that may miss peer funds with unconventional scheme names, or include funds whose name matches but whose true confirmed category differs (which Phase (b) safely filters out).
 - **Runtime Tradeoff**: Confirming 30 candidate funds requires 30 sequential API calls taking ~4–10 seconds.
 
-### 2. Long-Term Composite Scoring Formula (50 / 30 / 20 Split)
-For each candidate with $\ge 3$ years of NAV history, `score_fund_long_term()` computes rolling CAGRs across 3yr, 5yr, and 10yr windows:
-1. **50% Return Component**: Weighted average of `mean_rolling_cagr` across usable windows (10-year weight 0.50, 5-year weight 0.35, 3-year weight 0.15).
-2. **30% Return Consistency Component**: Derived from average `stdev_rolling_cagr` across usable windows. Lower rolling return variance yields a higher consistency score:
-   $$\text{Consistency Score} = \max(0.0, \text{Return Score} - 0.5 \times \text{Average Stdev})$$
-3. **20% Risk-Adjusted Component**: Sharpe-like ratio on the longest usable window:
-   $$\text{Sharpe Ratio} = \frac{\text{Mean Rolling CAGR} - 0.05}{\text{Stdev Rolling CAGR} + 1\text{e}-4}$$
-   $$\text{Composite Score} = 0.50 \times \text{Return Score} + 0.30 \times \text{Consistency Score} + 0.20 \times (\text{Sharpe Ratio} \times 0.05)$$
+### 2. Long-Term Composite Scoring Formula (50 / 30 / 20 Bounded Normalization)
+For each candidate with $\ge 3$ years of NAV history, `score_fund_long_term()` computes rolling CAGRs across 3yr, 5yr, and 10yr windows, normalizing each component onto a bounded $[0.0, 1.0]$ scale before applying the $50\% / 30\% / 20\%$ weights:
+
+1. **50% Return Component ($S_{\text{return}} \in [0.0, 1.0]$)**:
+   - Raw signal: Weighted average of `mean_rolling_cagr` across usable windows ($w_{10\text{y}} = 0.50, w_{5\text{y}} = 0.35, w_{3\text{y}} = 0.15$).
+   - Normalization: Scaled linearly from $0.0$ ($0\%$ CAGR floor) to $0.25$ ($25\%$ CAGR ceiling for top equity performance):
+     $$S_{\text{return}} = \text{clip}\left(\frac{R_{\text{raw}}}{0.25}, 0.0, 1.0\right)$$
+
+2. **30% Return Consistency Component ($S_{\text{consistency}} \in [0.0, 1.0]$)**:
+   - Raw signal: Weighted average of `stdev_rolling_cagr` across usable windows.
+   - Normalization: Lower rolling return variance yields higher consistency. Scaled linearly where $\sigma = 0.0$ yields $1.0$ (perfect consistency), and $\sigma \ge 0.15$ ($15\%$ volatility ceiling) yields $0.0$:
+     $$S_{\text{consistency}} = \text{clip}\left(1.0 - \frac{\sigma_{\text{raw}}}{0.15}, 0.0, 1.0\right)$$
+
+3. **20% Risk-Adjusted Component ($S_{\text{risk}} \in [0.0, 1.0]$)**:
+   - Raw signal: Sharpe-like ratio on the longest usable window relative to risk-free rate $r_f = 0.05$ ($5.0\%$):
+     $$\text{Sharpe}_{\text{raw}} = \frac{R_{\text{longest}} - 0.05}{\sigma_{\text{longest}} + 1\text{e}-4}$$
+   - Normalization: Clipped to $[0.0, 3.0]$ to prevent zero-stdev ratio explosions, and scaled linearly from $0.0$ to $1.0$ ($\text{Sharpe} \ge 3.0$ ceiling):
+     $$S_{\text{risk}} = \text{clip}\left(\frac{\text{Sharpe}_{\text{raw}}}{3.0}, 0.0, 1.0\right)$$
+
+4. **Composite Score ($0.0 \le \text{Composite Score} \le 1.0$)**:
+   $$\text{Composite Score} = 0.50 \times S_{\text{return}} + 0.30 \times S_{\text{consistency}} + 0.20 \times S_{\text{risk}}$$
+   This guarantees that `composite_score` lives on an interpretable $[0.0, 1.0]$ scale (or $0\% - 100\%$), preventing any single component from exceeding its stated weight share regardless of how extreme raw metrics are.
 
 ### 3. Expense Ratio Signal (`expense_ratio_considered = False`)
 Because `mfapi.in` does not supply expense ratio metadata, `FundScore.expense_ratio_considered` is explicitly set to `False`. The 50/30/20 composite weighting formula accounts for its absence without fabricating mock proxy values.

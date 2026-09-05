@@ -169,23 +169,31 @@ def score_fund_long_term(
     risk_free_rate = 0.05  # 5.0% risk-free rate benchmark assumption
     risk_adjusted_metric = float((mean_longest - risk_free_rate) / (stdev_longest + 1e-4))
 
-    # 2. Composite Score Weights over Usable Windows (50 / 30 / 20 Split)
+    # 2. Bounded Component Normalization (0.0 to 1.0 Scale)
+    # Target window priority weights (10y > 5y > 3y)
     base_weights = {10.0: 0.50, 5.0: 0.35, 3.0: 0.15}
     sum_weights = sum(base_weights.get(w, 0.20) for w in usable_windows)
     norm_weights = {w: base_weights.get(w, 0.20) / sum_weights for w in usable_windows}
 
-    # Return Component (50%)
-    return_score = sum(norm_weights[w] * mean_by_window[f"{w:g}y"] for w in usable_windows)
+    # (a) Return Component (50% weight)
+    # Raw return signal: Weighted average mean rolling CAGR across usable windows.
+    # Scaled linearly from 0.0 (0% return floor) to 0.25 (25% CAGR ceiling for top long-term performance).
+    raw_return = sum(norm_weights[w] * mean_by_window[f"{w:g}y"] for w in usable_windows)
+    norm_return = float(np.clip(raw_return / 0.25, 0.0, 1.0))
 
-    # Consistency Component (30% - lower stdev yields higher consistency contribution)
-    avg_stdev = sum(norm_weights[w] * stdev_by_window[f"{w:g}y"] for w in usable_windows)
-    consistency_score = max(0.0, return_score - 0.5 * avg_stdev)
+    # (b) Consistency Component (30% weight)
+    # Raw consistency signal: Weighted average rolling CAGR standard deviation.
+    # Scaled linearly where stdev=0.0 yields 1.0 consistency, and stdev>=0.15 (15% volatility ceiling) yields 0.0.
+    raw_avg_stdev = sum(norm_weights[w] * stdev_by_window[f"{w:g}y"] for w in usable_windows)
+    norm_consistency = float(np.clip(1.0 - (raw_avg_stdev / 0.15), 0.0, 1.0))
 
-    # Risk-Adjusted Component (20%)
-    risk_score = max(0.0, risk_adjusted_metric * 0.05)
+    # (c) Risk-Adjusted Component (20% weight)
+    # Raw Sharpe-like ratio clipped to [0.0, 3.0] to prevent zero-stdev ratio explosions.
+    # Scaled linearly from 0.0 (Sharpe=0) to 1.0 (Sharpe>=3.0 ceiling).
+    norm_risk = float(np.clip(risk_adjusted_metric / 3.0, 0.0, 1.0))
 
-    # Composite Score
-    composite_score = 0.50 * return_score + 0.30 * consistency_score + 0.20 * risk_score
+    # 3. Composite Score (50% Return + 30% Consistency + 20% Risk-Adjusted) -> Bounded [0.0, 1.0]
+    composite_score = float(0.50 * norm_return + 0.30 * norm_consistency + 0.20 * norm_risk)
 
     normalized_cat = normalize_category_keyword(nav_history.metadata.scheme_category)
 
