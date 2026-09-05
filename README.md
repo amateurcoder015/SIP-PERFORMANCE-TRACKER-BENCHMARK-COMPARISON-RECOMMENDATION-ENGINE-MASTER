@@ -22,9 +22,56 @@ This tool:
 
 - [x] **Step 1 (Core Math Engine)**: XIRR calculation engine, CAGR / Rolling CAGR module, and cashflow benchmark replication logic. Pure mathematical calculations fully unit-tested against hand-verified cashflow examples.
 - [x] **Step 2 (Data Layer)**: Real mutual fund NAV and scheme metadata fetcher via `mfapi.in`, real benchmark index fetcher via `yfinance`, and CSV transaction parser with zero live-network dependency in unit tests.
+- [x] **Step 2 Extension (Versatile CSV Ingestion)**: Two-stage versatile CSV ingestion supporting simple CSVs and real broker tradebooks (e.g. Zerodha Console `broker_tradebook_v1`), ISIN-to-scheme-code network resolution caching, derived execution amounts, and sell-row exclusions.
 - [x] **Step 3 (Per-Fund Performance Engine)**: Single-fund and multi-fund performance orchestrators computing actual XIRR vs benchmark-equivalent XIRR and absolute alpha for identical cashflows.
-- [x] **Step 4 (Recommendation Engine — THIS RELEASE)**: Long-term-weighted peer discovery, category normalization, multi-window rolling CAGR scoring (50/30/20 composite model), plain-language rationale generator, and mandatory disclaimers.
-- [x] **Step 5 (Dashboard & Visual UI — FINAL RELEASE)**: React + FastAPI Bento-style web dashboard with per-fund XIRR cards, benchmark comparisons, long-term peer recommendations, and non-bypassable financial disclaimers.
+- [x] **Step 4 (Recommendation Engine)**: Long-term-weighted peer discovery, category normalization, multi-window rolling CAGR scoring (50/30/20 composite model), plain-language rationale generator, and mandatory disclaimers.
+- [x] **Step 5 (Dashboard & Visual UI)**: React + FastAPI Bento-style web dashboard with per-fund XIRR cards, benchmark comparisons, long-term peer recommendations, and non-bypassable financial disclaimers.
+
+---
+
+## Step 2 Extension — Versatile CSV Ingestion Specifications
+
+### 1. Two-Stage CSV Ingestion Architecture
+
+To handle real-world broker-exported mutual fund tradebooks (e.g. Zerodha Console tradebook exports) alongside simple CSV files, CSV ingestion is structured into a clean two-stage pipeline:
+
+```
+┌───────────────────────────────────────────────────────────┐
+│ Stage 1: Raw Parsing & Auto-Detection (Offline Buffer)    │
+│  - Inspects headers: 'simple' vs 'broker_tradebook_v1'    │
+│  - Extracts date, amount = round(qty * price, 2)          │
+│  - Handles CRLF line endings & trailing empty columns    │
+│  - Filters sell rows into excluded_non_buy_transactions   │
+└─────────────────────────────┬─────────────────────────────┘
+                              │ Returns ParsedCSVResult
+                              ▼
+┌───────────────────────────────────────────────────────────┐
+│ Stage 2: Network Identifier Resolution (API / Service)   │
+│  - If identifier_type == 'isin', fetches scheme_list      │
+│  - Maps ISIN -> scheme_code via isin_growth / div attrs   │
+│  - Reuses per-call lookup cache for O(1) resolution       │
+│  - Converts RawParsedTransaction -> ParsedSIPTransaction  │
+└───────────────────────────────────────────────────────────┘
+```
+
+### 2. Supported Formats & Format Auto-Detection (`detect_csv_format`)
+- **`simple` Format**: Simple CSV with columns `date`, `amount`, and `scheme_code` (or `scheme_name`).
+- **`broker_tradebook_v1` Format**: Real broker tradebook export (e.g. Zerodha Console) containing `trade_date`, `isin` (or `symbol`), `quantity`, `price`, `trade_type`, `series`, etc.
+
+### 3. Derived Cashflow Amounts & Broker Execution Caveat
+For `broker_tradebook_v1` tradebooks, cashflow amounts are derived as:
+$$\text{amount} = \text{round}(\text{quantity} \times \text{price}, 2)$$
+
+> [!NOTE]
+> **Derivation Caveat**: Amounts derived as $\text{round}(\text{quantity} \times \text{price}, 2)$ reflect actual broker cash outflows paid at trade execution. These amounts may differ slightly from official mutual fund NAV-based unit allocation calculations due to broker execution fees, stamp duty, or fractional unit rounding by the Asset Management Company (AMC).
+
+### 4. Non-Buy (Sell Row) Exclusion Policy
+Non-buy rows (`trade_type == "sell"`) are intentionally excluded from active investment analysis into `excluded_non_buy_transactions` rather than executing redemption math.
+
+> [!IMPORTANT]
+> **Why Sell Rows Are Excluded**: SIP performance tracking and benchmark replication evaluate systematic accumulation cashflows. Partial redemptions introduce complex capital gains accounting, FIFO tax lot tracking, and benchmark cashflow replication ambiguity outside the scope of Step 3/4 per-fund performance calculation. Excluded sell transactions are returned in API responses with explicit exclusion reason notes (`"Non-buy transaction type (sell) excluded from SIP accumulation analysis"`).
+
+---
 
 ---
 

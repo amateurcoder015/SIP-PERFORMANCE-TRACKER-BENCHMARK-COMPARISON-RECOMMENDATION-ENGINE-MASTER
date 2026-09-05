@@ -2,8 +2,8 @@
 FastAPI Backend API Layer for SIP Performance Tracker & Recommendation Engine.
 
 Exposes endpoints for:
-1. POST /api/upload-transactions — CSV upload & parsing
-2. POST /api/performance — Per-fund performance evaluation vs benchmark with exception isolation
+1. POST /api/upload-transactions — CSV upload & versatile parsing (supports Simple & Broker Tradebook formats)
+2. POST /api/performance — Per-fund performance evaluation vs benchmark with identifier resolution & exception isolation
 3. POST /api/recommend — Long-term peer discovery, scoring, and recommendations with mandatory disclaimer
 """
 
@@ -20,10 +20,14 @@ from pydantic import BaseModel, Field
 from src.data_fetch import (
     fetch_benchmark_series,
     fetch_fund_nav_history,
+    fetch_scheme_list,
     parse_sip_transactions_csv,
+    resolve_transaction_identifiers,
     BenchmarkSeries,
     FundNAVHistory,
+    ParsedCSVResult,
     ParsedSIPTransaction,
+    RawParsedTransaction,
 )
 from src.performance_engine import evaluate_all_funds, FundPerformanceResult
 from src.recommendation_engine import (
@@ -91,9 +95,12 @@ async def general_exception_handler(request, exc: Exception):
 # Request Models
 class TransactionInputModel(BaseModel):
     date: str = Field(..., description="Transaction date in YYYY-MM-DD format")
-    scheme_code: str = Field(..., description="AMFI Mutual Fund Scheme Code")
+    scheme_code: Optional[str] = Field(None, description="AMFI Mutual Fund Scheme Code or ISIN")
+    identifier_type: Optional[str] = Field("scheme_code", description="scheme_code | isin | scheme_name")
+    identifier_value: Optional[str] = Field(None, description="Raw ISIN, scheme_code, or symbol")
     scheme_name: Optional[str] = Field(None, description="Scheme Name")
     amount: float = Field(..., gt=0, description="SIP Contribution Amount (> 0)")
+    trade_type: Optional[str] = Field("buy", description="buy | sell")
 
 
 class PerformanceRequestModel(BaseModel):
@@ -146,7 +153,7 @@ def health_check():
 @app.post("/api/upload-transactions")
 async def upload_transactions(file: UploadFile = File(...)):
     """
-    Accept CSV file upload, parse SIP transactions, and return parse summary grouped by scheme code.
+    Accept CSV file upload (Simple or Broker Tradebook), parse SIP transactions, and return parse summary.
     """
     if not file.filename.endswith((".csv", ".txt")):
         raise ValueError("Uploaded file must be a CSV format (.csv file).")
@@ -156,23 +163,23 @@ async def upload_transactions(file: UploadFile = File(...)):
         raise ValueError("Uploaded CSV file is empty.")
 
     buffer = io.BytesIO(contents)
-    parsed_records = parse_sip_transactions_csv(buffer)
+    parsed_csv_result = parse_sip_transactions_csv(buffer)
 
-    # Group summary by scheme_code
+    # Group summary by identifier_value
     scheme_summary_map: Dict[str, Dict[str, Any]] = {}
-    for tx in parsed_records:
-        code = str(tx.scheme_code).strip()
-        name = tx.scheme_name or f"Scheme {code}"
-        if code not in scheme_summary_map:
-            scheme_summary_map[code] = {
-                "scheme_code": code,
-                "scheme_name": name,
+    for tx in parsed_csv_result.transactions:
+        id_val = str(tx.identifier_value).strip()
+        if id_val not in scheme_summary_map:
+            scheme_summary_map[id_val] = {
+                "scheme_code": id_val if tx.identifier_type == "scheme_code" else None,
+                "identifier_type": tx.identifier_type,
+                "identifier_value": id_val,
                 "transaction_count": 0,
                 "total_amount": 0.0,
                 "start_date": tx.date.strftime("%Y-%m-%d"),
                 "end_date": tx.date.strftime("%Y-%m-%d"),
             }
-        summary = scheme_summary_map[code]
+        summary = scheme_summary_map[id_val]
         summary["transaction_count"] += 1
         summary["total_amount"] += tx.amount
         if tx.date.strftime("%Y-%m-%d") < summary["start_date"]:
@@ -181,16 +188,28 @@ async def upload_transactions(file: UploadFile = File(...)):
             summary["end_date"] = tx.date.strftime("%Y-%m-%d")
 
     return {
-        "total_transactions": len(parsed_records),
+        "total_transactions": len(parsed_csv_result.transactions),
+        "excluded_non_buy_count": len(parsed_csv_result.excluded_non_buy_transactions),
         "schemes": list(scheme_summary_map.values()),
         "transactions": [
             {
                 "date": t.date.strftime("%Y-%m-%d"),
-                "scheme_code": str(t.scheme_code).strip(),
-                "scheme_name": t.scheme_name,
                 "amount": t.amount,
+                "identifier_type": t.identifier_type,
+                "identifier_value": t.identifier_value,
+                "trade_type": t.trade_type,
             }
-            for t in parsed_records
+            for t in parsed_csv_result.transactions
+        ],
+        "excluded_transactions": [
+            {
+                "date": t.date.strftime("%Y-%m-%d"),
+                "amount": t.amount,
+                "identifier_type": t.identifier_type,
+                "identifier_value": t.identifier_value,
+                "trade_type": t.trade_type,
+            }
+            for t in parsed_csv_result.excluded_non_buy_transactions
         ],
     }
 
@@ -199,30 +218,50 @@ async def upload_transactions(file: UploadFile = File(...)):
 def evaluate_performance(payload: PerformanceRequestModel):
     """
     Evaluate actual fund XIRR, benchmark-equivalent XIRR, and alpha for multiple funds.
+    Supports resolving ISIN identifiers via Stage 2 resolution.
     Implements per-fund exception isolation.
     """
     if not payload.transactions:
         raise ValueError("No transactions provided for performance evaluation.")
 
-    # Parse transaction objects
-    domain_txs: List[ParsedSIPTransaction] = []
-    distinct_scheme_codes = set()
+    # Convert to RawParsedTransaction list
+    raw_txs: List[RawParsedTransaction] = []
 
     for item in payload.transactions:
         try:
             dt = datetime.strptime(item.date, "%Y-%m-%d").date()
         except ValueError:
             raise ValueError(f"Invalid date format '{item.date}'. Expected YYYY-MM-DD.")
-        code = str(item.scheme_code).strip()
-        distinct_scheme_codes.add(code)
-        domain_txs.append(
-            ParsedSIPTransaction(
+
+        # Support scheme_code or identifier_value
+        if item.identifier_value:
+            id_type = item.identifier_type or "isin"
+            id_val = item.identifier_value
+        elif item.scheme_code:
+            # Check if scheme_code looks like ISIN (starts with INF)
+            if item.scheme_code.startswith("INF"):
+                id_type = "isin"
+            else:
+                id_type = "scheme_code"
+            id_val = item.scheme_code
+        else:
+            raise ValueError(f"Transaction on {item.date} has no scheme_code or identifier_value.")
+
+        raw_txs.append(
+            RawParsedTransaction(
                 date=dt,
-                scheme_code=code,
-                scheme_name=item.scheme_name,
                 amount=item.amount,
+                identifier_type=id_type,
+                identifier_value=id_val,
+                trade_type=item.trade_type or "buy",
             )
         )
+
+    # Stage 2 Identifier Resolution
+    scheme_list = fetch_scheme_list()
+    resolved_domain_txs = resolve_transaction_identifiers(raw_txs, scheme_list)
+
+    distinct_scheme_codes = set(t.scheme_code for t in resolved_domain_txs)
 
     # Parse optional valuation date
     val_date: Optional[date] = None
@@ -247,7 +286,7 @@ def evaluate_performance(payload: PerformanceRequestModel):
 
     # Evaluate funds
     evaluation_results = evaluate_all_funds(
-        transactions=domain_txs,
+        transactions=resolved_domain_txs,
         nav_histories=nav_histories,
         benchmark_series=benchmark_series,
         valuation_date=val_date,

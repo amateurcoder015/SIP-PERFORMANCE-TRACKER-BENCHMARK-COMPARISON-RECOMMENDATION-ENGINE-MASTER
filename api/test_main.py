@@ -57,7 +57,7 @@ def test_upload_transactions_missing_columns_error():
 
     res = client.post("/api/upload-transactions", files=files)
     assert res.status_code == 400
-    assert "missing required column" in res.json()["detail"]
+    assert "Unrecognized CSV format" in res.json()["detail"]
 
 
 def test_evaluate_performance_success_and_per_fund_isolation():
@@ -104,10 +104,16 @@ def test_evaluate_performance_success_and_per_fund_isolation():
         [(date(2021, 1, 1), 100.0)],
     )
 
-    with patch("api.main.fetch_benchmark_series", return_value=mock_bm_series):
-        with patch("api.main.get_cached_nav_history", return_value=mock_nav_history):
-            with patch("api.main.evaluate_all_funds", return_value=mock_eval_results):
-                res = client.post("/api/performance", json=payload)
+    mock_scheme_list = [
+        FundMetadata(100, "Fund 100", "House", "Cat", "Type", "2022-01-01"),
+        FundMetadata(200, "Fund 200", "House", "Cat", "Type", "2022-01-01"),
+    ]
+
+    with patch("api.main.fetch_scheme_list", return_value=mock_scheme_list):
+        with patch("api.main.fetch_benchmark_series", return_value=mock_bm_series):
+            with patch("api.main.get_cached_nav_history", return_value=mock_nav_history):
+                with patch("api.main.evaluate_all_funds", return_value=mock_eval_results):
+                    res = client.post("/api/performance", json=payload)
 
                 assert res.status_code == 200
                 data = res.json()

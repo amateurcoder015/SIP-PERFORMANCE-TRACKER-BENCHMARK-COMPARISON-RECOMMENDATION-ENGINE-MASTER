@@ -12,6 +12,13 @@ CONVENTIONS & DATA CONTRACTS:
    ParsedSIPTransaction.amount stores contribution amounts as POSITIVE numbers (> 0) representing
    raw user input from CSV. The negative sign flip (< 0) required by Step 1's calculate_xirr()
    is performed at cashflow assembly in Step 3, NOT inside this module.
+
+3. Versatile Two-Stage CSV Ingestion:
+   - Stage 1 (Offline Raw Parsing): detect_csv_format() distinguishes 'simple' (date, amount, scheme_code)
+     and 'broker_tradebook_v1' (trade_date, isin/symbol, quantity, price) formats. Derives amount = round(qty * price, 2)
+     and isolates non-buy (sell) rows into excluded_non_buy_transactions.
+   - Stage 2 (Network Identifier Resolution): resolve_transaction_identifiers() maps ISINs to scheme codes using
+     fetch_scheme_list() metadata with per-call caching.
 """
 
 from dataclasses import dataclass
@@ -58,6 +65,8 @@ class FundMetadata:
     scheme_category: str
     scheme_type: str
     data_retrieved_at: str
+    isin_growth: Optional[str] = None
+    isin_div_reinvestment: Optional[str] = None
 
 
 @dataclass
@@ -77,21 +86,68 @@ class BenchmarkSeries:
 
 
 @dataclass
+class RawParsedTransaction:
+    """Raw parsed CSV transaction record prior to identifier resolution."""
+    date: date
+    amount: float  # Stored as POSITIVE float (> 0), derived as round(quantity * price, 2) for tradebooks
+    identifier_type: str  # "scheme_code" | "isin" | "scheme_name"
+    identifier_value: str
+    trade_type: str = "buy"  # "buy" | "sell" | other
+
+
+@dataclass
+class ParsedCSVResult:
+    """Container for raw parsed valid buy transactions and excluded non-buy transactions."""
+    transactions: List[RawParsedTransaction]
+    excluded_non_buy_transactions: List[RawParsedTransaction]
+
+
+@dataclass
 class ParsedSIPTransaction:
-    """Raw parsed SIP transaction record from CSV."""
+    """Resolved SIP transaction record ready for performance evaluation."""
     date: date
     scheme_code: str
     scheme_name: Optional[str]
     amount: float  # Stored as POSITIVE float (> 0)
 
 
+def detect_csv_format(
+    filepath_or_buffer: Union[str, io.StringIO, io.BytesIO]
+) -> str:
+    """
+    Detect the CSV format identifier based on header columns.
+
+    Returns "simple" or "broker_tradebook_v1".
+    Raises ValueError for unrecognized formats.
+    """
+    try:
+        if isinstance(filepath_or_buffer, (str, io.StringIO, io.BytesIO)):
+            df_head = pd.read_csv(filepath_or_buffer, nrows=2)
+            if hasattr(filepath_or_buffer, "seek"):
+                filepath_or_buffer.seek(0)
+        else:
+            raise ValueError("Invalid CSV buffer or filepath.")
+    except Exception as err:
+        raise ValueError(f"Failed to read CSV header for format detection: {err}") from err
+
+    cols_lower = set(str(c).strip().lower() for c in df_head.columns)
+
+    if {"date", "amount"}.issubset(cols_lower) and ("scheme_code" in cols_lower or "scheme_name" in cols_lower):
+        return "simple"
+    elif {"trade_date", "quantity", "price"}.issubset(cols_lower) and ("isin" in cols_lower or "symbol" in cols_lower):
+        return "broker_tradebook_v1"
+    else:
+        sorted_cols = sorted(list(cols_lower))
+        raise ValueError(
+            f"Unrecognized CSV format. Headers: {sorted_cols}. Supported formats: 'simple' (date, amount, scheme_code/scheme_name) or 'broker_tradebook_v1' (trade_date, isin/symbol, quantity, price)."
+        )
+
+
 def parse_sip_transactions_csv(
     filepath_or_buffer: Union[str, io.StringIO, io.BytesIO]
-) -> List[ParsedSIPTransaction]:
+) -> ParsedCSVResult:
     """
-    Parse and validate a SIP transaction CSV file or buffer.
-
-    Expected CSV columns: `date`, `amount`, and `scheme_code` or `scheme_name`.
+    Parse and validate a SIP transaction CSV file or buffer (Stage 1 Offline Parsing).
 
     Parameters
     ----------
@@ -100,25 +156,31 @@ def parse_sip_transactions_csv(
 
     Returns
     -------
-    List[ParsedSIPTransaction]
-        Parsed transaction records sorted ASCENDING by date.
-
-    Raises
-    ------
-    ValueError
-        If required columns are missing, dates are invalid, or amounts are <= 0.
+    ParsedCSVResult
+        Parsed buy transactions and excluded non-buy (sell) transactions.
     """
+    fmt = detect_csv_format(filepath_or_buffer)
+    if fmt == "simple":
+        return _parse_simple_csv(filepath_or_buffer)
+    elif fmt == "broker_tradebook_v1":
+        return _parse_broker_tradebook_v1_csv(filepath_or_buffer)
+    else:
+        raise ValueError(f"Unsupported CSV format '{fmt}'.")
+
+
+def _parse_simple_csv(
+    filepath_or_buffer: Union[str, io.StringIO, io.BytesIO]
+) -> ParsedCSVResult:
+    """Parse original simple-format CSV (date, amount, scheme_code/scheme_name)."""
     try:
         df = pd.read_csv(filepath_or_buffer)
     except Exception as err:
         raise ValueError(f"Failed to read CSV file or buffer: {err}") from err
 
-    # Normalize column names to lowercase stripped strings
     cols_lower = [str(c).strip().lower() for c in df.columns]
     col_map = {orig: lower for orig, lower in zip(df.columns, cols_lower)}
     df = df.rename(columns=col_map)
 
-    # Check required columns
     required_base = {"date", "amount"}
     missing = required_base - set(df.columns)
     if missing or not ("scheme_code" in df.columns or "scheme_name" in df.columns):
@@ -127,23 +189,20 @@ def parse_sip_transactions_csv(
         missing_sorted = sorted(list(missing))
         raise ValueError(f"CSV is missing required column(s): {', '.join(missing_sorted)}")
 
-    parsed_records: List[ParsedSIPTransaction] = []
+    transactions: List[RawParsedTransaction] = []
+    excluded: List[RawParsedTransaction] = []
 
     for row_idx, row in df.iterrows():
-        row_num = row_idx + 2  # 1-indexed accounting for CSV header row
+        row_num = row_idx + 2
 
-        # Parse date
         raw_dt = row.get("date")
         if pd.isna(raw_dt) or str(raw_dt).strip() == "":
             raise ValueError(f"Row {row_num}: column 'date' is empty")
-
         parsed_date = _parse_date_string(str(raw_dt).strip(), row_num)
 
-        # Parse amount
         raw_amt = row.get("amount")
         if pd.isna(raw_amt):
             raise ValueError(f"Row {row_num}: column 'amount' is empty")
-
         try:
             float_amt = float(raw_amt)
         except (ValueError, TypeError) as err:
@@ -152,27 +211,196 @@ def parse_sip_transactions_csv(
         if float_amt <= 0:
             raise ValueError(f"Row {row_num}: amount must be a positive number (> 0), got {float_amt}")
 
-        # Parse scheme_code / scheme_name
         code_val = str(row.get("scheme_code")).strip() if "scheme_code" in df.columns and not pd.isna(row.get("scheme_code")) else ""
-        name_val = str(row.get("scheme_name")).strip() if "scheme_name" in df.columns and not pd.isna(row.get("scheme_name")) else None
+        name_val = str(row.get("scheme_name")).strip() if "scheme_name" in df.columns and not pd.isna(row.get("scheme_name")) else ""
 
         if not code_val and not name_val:
             raise ValueError(f"Row {row_num}: scheme_code and scheme_name cannot both be empty")
 
-        primary_code = code_val if code_val else (name_val or "")
+        if code_val:
+            id_type = "scheme_code"
+            id_val = code_val
+        else:
+            id_type = "scheme_name"
+            id_val = name_val
 
-        parsed_records.append(
-            ParsedSIPTransaction(
-                date=parsed_date,
-                scheme_code=primary_code,
-                scheme_name=name_val,
-                amount=float_amt,
-            )
+        raw_tx = RawParsedTransaction(
+            date=parsed_date,
+            amount=float_amt,
+            identifier_type=id_type,
+            identifier_value=id_val,
+            trade_type="buy",
+        )
+        transactions.append(raw_tx)
+
+    transactions.sort(key=lambda x: x.date)
+    return ParsedCSVResult(transactions=transactions, excluded_non_buy_transactions=excluded)
+
+
+def _parse_broker_tradebook_v1_csv(
+    filepath_or_buffer: Union[str, io.StringIO, io.BytesIO]
+) -> ParsedCSVResult:
+    """Parse Zerodha Console broker tradebook format (trade_date, isin/symbol, quantity, price, trade_type)."""
+    try:
+        df = pd.read_csv(filepath_or_buffer)
+    except Exception as err:
+        raise ValueError(f"Failed to read broker tradebook CSV: {err}") from err
+
+    cols_lower = [str(c).strip().lower() for c in df.columns]
+    col_map = {orig: lower for orig, lower in zip(df.columns, cols_lower)}
+    df = df.rename(columns=col_map)
+
+    required_base = {"trade_date", "quantity", "price"}
+    missing = required_base - set(df.columns)
+    if missing or not ("isin" in df.columns or "symbol" in df.columns):
+        if not ("isin" in df.columns or "symbol" in df.columns):
+            missing.add("isin/symbol")
+        missing_sorted = sorted(list(missing))
+        raise ValueError(f"Broker tradebook CSV is missing required column(s): {', '.join(missing_sorted)}")
+
+    transactions: List[RawParsedTransaction] = []
+    excluded: List[RawParsedTransaction] = []
+
+    for row_idx, row in df.iterrows():
+        row_num = row_idx + 2
+
+        raw_dt = row.get("trade_date")
+        if pd.isna(raw_dt) or str(raw_dt).strip() == "":
+            raise ValueError(f"Row {row_num}: column 'trade_date' is empty")
+        parsed_date = _parse_date_string(str(raw_dt).strip(), row_num)
+
+        raw_qty = row.get("quantity")
+        raw_price = row.get("price")
+        if pd.isna(raw_qty) or pd.isna(raw_price):
+            raise ValueError(f"Row {row_num}: quantity and price cannot be empty")
+        try:
+            qty = float(raw_qty)
+            price = float(raw_price)
+        except (ValueError, TypeError) as err:
+            raise ValueError(f"Row {row_num}: invalid quantity/price numeric values: '{raw_qty}', '{raw_price}'") from err
+
+        if qty <= 0 or price <= 0:
+            raise ValueError(f"Row {row_num}: quantity ({qty}) and price ({price}) must be positive numbers (> 0)")
+
+        derived_amount = round(qty * price, 2)
+
+        isin_val = str(row.get("isin")).strip() if "isin" in df.columns and not pd.isna(row.get("isin")) else ""
+        symbol_val = str(row.get("symbol")).strip() if "symbol" in df.columns and not pd.isna(row.get("symbol")) else ""
+
+        if not isin_val and not symbol_val:
+            raise ValueError(f"Row {row_num}: isin and symbol cannot both be empty")
+
+        if isin_val:
+            id_type = "isin"
+            id_val = isin_val
+        else:
+            id_type = "scheme_name"
+            id_val = symbol_val
+
+        raw_trade_type = str(row.get("trade_type", "buy")).strip().lower()
+
+        raw_tx = RawParsedTransaction(
+            date=parsed_date,
+            amount=derived_amount,
+            identifier_type=id_type,
+            identifier_value=id_val,
+            trade_type=raw_trade_type,
         )
 
-    # Sort ascending by date
-    parsed_records.sort(key=lambda x: x.date)
-    return parsed_records
+        if raw_trade_type == "buy":
+            transactions.append(raw_tx)
+        else:
+            excluded.append(raw_tx)
+
+    transactions.sort(key=lambda x: x.date)
+    excluded.sort(key=lambda x: x.date)
+    return ParsedCSVResult(transactions=transactions, excluded_non_buy_transactions=excluded)
+
+
+def resolve_transaction_identifiers(
+    raw_transactions: List[RawParsedTransaction],
+    scheme_list: List[FundMetadata],
+    session: Optional[requests.Session] = None,
+) -> List[ParsedSIPTransaction]:
+    """
+    Resolve RawParsedTransaction identifiers (ISIN / scheme_code) to ParsedSIPTransactions (Stage 2).
+
+    Parameters
+    ----------
+    raw_transactions : List[RawParsedTransaction]
+        Raw parsed transaction list.
+    scheme_list : List[FundMetadata]
+        Full AMFI scheme list metadata.
+    session : Optional[requests.Session]
+        Optional requests session.
+
+    Returns
+    -------
+    List[ParsedSIPTransaction]
+        Resolved transaction records with validated scheme_code and official scheme_name.
+    """
+    if not raw_transactions:
+        return []
+
+    # Build fast ISIN lookup map from scheme_list
+    isin_map: Dict[str, FundMetadata] = {}
+    for meta in scheme_list:
+        if meta.isin_growth:
+            isin_map[meta.isin_growth.strip().upper()] = meta
+        if meta.isin_div_reinvestment:
+            isin_map[meta.isin_div_reinvestment.strip().upper()] = meta
+
+    # Per-call resolution cache so each distinct ISIN is resolved ONCE
+    resolution_cache: Dict[str, FundMetadata] = {}
+    resolved_records: List[ParsedSIPTransaction] = []
+
+    for raw in raw_transactions:
+        if raw.identifier_type == "scheme_code":
+            clean_code = raw.identifier_value.strip()
+            resolved_records.append(
+                ParsedSIPTransaction(
+                    date=raw.date,
+                    scheme_code=clean_code,
+                    scheme_name=None,
+                    amount=raw.amount,
+                )
+            )
+        elif raw.identifier_type == "isin":
+            clean_isin = raw.identifier_value.strip().upper()
+            if clean_isin not in resolution_cache:
+                if clean_isin in isin_map:
+                    resolution_cache[clean_isin] = isin_map[clean_isin]
+                else:
+                    raise ValueError(f"Could not resolve ISIN '{clean_isin}' to any valid AMFI scheme code.")
+
+            matched_meta = resolution_cache[clean_isin]
+            resolved_records.append(
+                ParsedSIPTransaction(
+                    date=raw.date,
+                    scheme_code=str(matched_meta.scheme_code),
+                    scheme_name=matched_meta.scheme_name,
+                    amount=raw.amount,
+                )
+            )
+        elif raw.identifier_type == "scheme_name":
+            clean_name = raw.identifier_value.strip()
+            matched_meta = next((m for m in scheme_list if m.scheme_name.strip() == clean_name), None)
+            if not matched_meta:
+                raise ValueError(f"Could not resolve scheme name '{clean_name}' to any valid AMFI scheme code.")
+
+            resolved_records.append(
+                ParsedSIPTransaction(
+                    date=raw.date,
+                    scheme_code=str(matched_meta.scheme_code),
+                    scheme_name=matched_meta.scheme_name,
+                    amount=raw.amount,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported identifier_type '{raw.identifier_type}'.")
+
+    resolved_records.sort(key=lambda x: x.date)
+    return resolved_records
 
 
 def fetch_fund_nav_history(
@@ -183,29 +411,6 @@ def fetch_fund_nav_history(
 ) -> FundNAVHistory:
     """
     Fetch and normalize mutual fund NAV history and metadata from mfapi.in.
-
-    Parameters
-    ----------
-    scheme_code : Union[int, str]
-        AMFI scheme code.
-    session : Optional[requests.Session]
-        Optional requests session for mocking or connection pooling.
-    timeout : int, default 15
-        Request timeout in seconds.
-    min_api_response_points : int, default 30
-        Minimum low-level API sanity threshold to reject empty or corrupted API payloads.
-        (Note: Financial span sufficiency e.g. 1y/3y/5y CAGR is validated separately by
-        validate_sufficient_history).
-
-    Returns
-    -------
-    FundNAVHistory
-        Normalized fund NAV history object with ASCENDING nav_series.
-
-    Raises
-    ------
-    ValueError
-        If scheme_code is invalid, scheme not found, or NAV payload has < min_api_response_points.
     """
     clean_code = str(scheme_code).strip()
     url = f"{MFAPI_BASE_URL}/{clean_code}"
@@ -247,7 +452,6 @@ def fetch_fund_nav_history(
             f"Scheme '{clean_code}' returned corrupt/insufficient API payload ({len(nav_points)} points < {min_api_response_points} min API sanity threshold)."
         )
 
-    # Sort ascending by date (since mfapi.in delivers descending order)
     validated_nav = validate_nav_series(nav_points)
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -269,11 +473,6 @@ def fetch_scheme_list(
 ) -> List[FundMetadata]:
     """
     Fetch full AMFI mutual fund scheme list from mfapi.in.
-
-    Returns
-    -------
-    List[FundMetadata]
-        List of scheme metadata summaries.
     """
     client = session or requests
     try:
@@ -293,6 +492,9 @@ def fetch_scheme_list(
         try:
             code = int(item.get("schemeCode"))
             name = str(item.get("schemeName"))
+            g_isin = str(item.get("isinGrowth")).strip() if item.get("isinGrowth") else None
+            d_isin = str(item.get("isinDivReinvestment")).strip() if item.get("isinDivReinvestment") else None
+
             schemes.append(
                 FundMetadata(
                     scheme_code=code,
@@ -301,6 +503,8 @@ def fetch_scheme_list(
                     scheme_category="Unknown",
                     scheme_type="Unknown",
                     data_retrieved_at=now_iso,
+                    isin_growth=g_isin,
+                    isin_div_reinvestment=d_isin,
                 )
             )
         except (ValueError, TypeError):
@@ -316,25 +520,6 @@ def fetch_benchmark_series(
 ) -> BenchmarkSeries:
     """
     Fetch historical daily benchmark closing prices using yfinance.
-
-    Parameters
-    ----------
-    benchmark_name : str
-        Benchmark name or symbol (e.g. "NIFTY50", "SENSEX", "NIFTYMIDCAP", "NIFTYBANK").
-    start_date : Optional[date]
-        Requested start date.
-    end_date : Optional[date]
-        Requested end date.
-
-    Returns
-    -------
-    BenchmarkSeries
-        Benchmark series with ASCENDING level_series.
-
-    Raises
-    ------
-    ValueError
-        If benchmark_name is unsupported or requested range precedes available data.
     """
     normalized_name = benchmark_name.strip().upper()
     ticker = BENCHMARK_TICKER_MAP.get(normalized_name)
